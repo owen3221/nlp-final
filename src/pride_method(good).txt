@@ -1,0 +1,139 @@
+import re
+import time
+import math
+
+import numpy as np
+
+from util import get_result_dir
+from prompt import PRIDE_TEMPLATE
+from gen import get_response_google
+
+
+def softmax(logits: np.ndarray) -> np.ndarray:
+    """对数几率向量做 softmax，返回概率向量。"""
+    ex = np.exp(logits - np.max(logits))
+    return ex / ex.sum()
+
+
+def extract_choice_logprobs(response: dict, choices: list[str]) -> np.ndarray:
+    """
+    从 Gemini 返回的 text 中解析每个选项的概率，并转成 log-prob：
+      例如 response["candidates"][0]["content"]["parts"][0]["text"] 是：
+        A: 0.10
+        B: 0.20
+        C: 0.30
+        D: 0.40
+    返回 [log(0.10), log(0.20), log(0.30), log(0.40)]。
+    """
+    text = response["candidates"][0]["content"]["parts"][0]["text"]
+    probs = []
+    for letter in ["A", "B", "C", "D"]:
+        m = re.search(rf"{letter}:\s*([01](?:\.\d+)?)", text)
+        if m:
+            p = float(m.group(1))
+        else:
+            # 未匹配到时赋极小概率，避免 log(0)
+            p = 1e-8
+        probs.append(p)
+    return np.log(np.array(probs, dtype=float))
+
+
+def estimate_prior(D_e: list[tuple], model: str = "google") -> np.ndarray:
+    """
+    阶段1：用前 K=|D_e| 道题做循环置换，估计先验分布 P_prior。
+    返回长度 n 的概率向量。
+    """
+    all_priors = []
+    for question, choices, _ in D_e:
+        n = len(choices)
+        permuted_logits = []
+        for shift in range(n):
+            permuted = choices[-shift:] + choices[:-shift]
+            prompt = PRIDE_TEMPLATE.format(
+                Question=question,
+                A=permuted[0], B=permuted[1],
+                C=permuted[2], D=permuted[3],
+            )
+            rsp = get_response_google([prompt])[0]
+            # Free Tier 限速：15 请求/min → 最少 4s 间隔
+            time.sleep(60 / 15)
+            logps = extract_choice_logprobs(rsp, choices)
+            permuted_logits.append(logps)
+
+        avg_log = np.mean(permuted_logits, axis=0)
+        all_priors.append(softmax(avg_log))
+
+    # 把所有样本的 P_prior 平均，得到全局 prior
+    return np.mean(np.stack(all_priors, axis=0), axis=0)
+
+
+def create_pride_exp(
+    dataset,
+    lang: str,
+    subject: str,
+    model: str = "google",
+    K: int = 5,
+):
+    """
+    对整个实验集合做 PriDe：
+      1) 用前 K 道题估计 P_prior
+      2) 对剩余题目各做一次调用，提取 P_observed，去偏并选最大
+    输出的 JSONL 包含：
+      - request
+      - raw_response
+      - pred_idx
+      - final_probs
+      - answer (ground truth)
+    """
+    # 如果 dataset 是 dict-of-lists，就转成 list-of-dicts
+    if isinstance(dataset, dict):
+        dataset = [
+            {"question": q, "choices": c, "answer": a}
+            for q, c, a in zip(
+                dataset["question"],
+                dataset["choices"],
+                dataset["answer"],
+            )
+        ]
+
+    samples = [(d["question"], d["choices"], d["answer"]) for d in dataset]
+    D_e, D_r = samples[:K], samples[K:]
+
+    # 阶段1：估先验
+    prior = estimate_prior(D_e, model)
+
+    # 阶段2：去偏 + 存结果
+    for idx, (q, choices, ans) in enumerate(D_r):
+        prompt = PRIDE_TEMPLATE.format(
+            Question=q,
+            A=choices[0], B=choices[1],
+            C=choices[2], D=choices[3],
+        )
+        rsp = get_response_google([prompt])[0]
+        time.sleep(60 / 15)
+
+        observed = extract_choice_logprobs(rsp, choices)
+        debiased_logits = observed - np.log(prior)
+        final_probs = softmax(debiased_logits)
+        pred_idx = int(np.argmax(final_probs))
+
+        from exp import save_responses
+
+        responses = [{
+            "request": prompt,
+            "raw_response": rsp,
+            "pred_idx": pred_idx,
+            "final_probs": final_probs.tolist(),
+            "answer": ans,
+        }]
+
+        save_responses(
+            model="google",
+            prompt_method="pride",
+            requests=[prompt],
+            responses=responses,
+            lang=lang,
+            subject=subject,
+            answer=ans,
+            index=idx,
+        )
