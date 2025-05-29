@@ -24,7 +24,8 @@ poetry install --no-root
 python test/test.py --model google
 ```
 
-##Run pride_method
+## Run pride_method
+
 ```shell
 python src/exp.py \--exp taskc \--model google \--prompt_method pride
 ```
